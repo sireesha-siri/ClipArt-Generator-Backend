@@ -1,172 +1,226 @@
-import React, { useRef, useEffect, useState } from 'react';
-import {
-  View, Text, ScrollView, TouchableOpacity,
-  Animated, Alert,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
-import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
-import * as FileSystem from 'expo-file-system';
-import { Download, ArrowLeft } from 'lucide-react-native';
-import ResultCard from '../components/ResultCard';
-import { ART_STYLES } from '../utils/constants';
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const axios = require('axios');
+const rateLimit = require('express-rate-limit');
+const sharp = require('sharp');
+const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
 
-// ✅ Simple — backend now returns real HTTPS URLs, just download directly
-async function imageToLocalFile(outputUrl, style) {
-  const dest = `${FileSystem.cacheDirectory}clipart_${style}_${Date.now()}.png`;
-  await FileSystem.downloadAsync(outputUrl, dest);
-  return dest;
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ✅ Serve generated images as static files
+const OUTPUT_DIR = path.join(__dirname, 'outputs');
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR);
+app.use('/outputs', express.static(OUTPUT_DIR));
+
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
+app.use(express.json({ limit: '15mb' }));
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000, max: 15,
+  message: { error: 'Too many requests. Please wait a minute.' }
+});
+app.use('/api/', limiter);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
+    allowed.includes(file.mimetype) ? cb(null, true) : cb(new Error('Invalid file type'));
+  },
+});
+
+const STABILITY_KEY = process.env.STABILITY_API_KEY;
+// ✅ This is set in Render environment variables
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const STRUCTURE_URL = 'https://api.stability.ai/v2beta/stable-image/control/structure';
+
+const STYLE_PROMPTS = {
+  cartoon: {
+    prompt: 'same people, same scene, cartoon illustration style, bold black outlines, vibrant cel-shading, Pixar Disney animation, expressive colorful clipart, same poses same composition',
+    negative_prompt: 'different people, different scene, blurry, ugly, deformed, realistic photo, extra limbs, wrong skin tone',
+    control_strength: '0.95',
+  },
+  anime: {
+    prompt: 'same people, same scene, anime illustration, Studio Ghibli style, large expressive eyes, smooth cel shading, vibrant Japanese animation, same poses same composition',
+    negative_prompt: 'different people, different scene, blurry, ugly, deformed, realistic photo, extra limbs, western cartoon',
+    control_strength: '0.95',
+  },
+  pixel: {
+    prompt: 'same people, same scene, pixel art style, 16-bit retro game sprite, chunky pixels, limited color palette, NES SNES aesthetic, same poses same composition',
+    negative_prompt: 'different people, different scene, blurry, smooth, realistic, photo, extra limbs',
+    control_strength: '0.92',
+  },
+  flat: {
+    prompt: 'same people, same scene, flat design vector illustration, minimalist art, clean bold geometric shapes, solid colors, no gradients, no shadows, modern graphic clipart, same poses same composition',
+    negative_prompt: 'different people, different scene, realistic, photo, 3d, texture, gradient, shadow, blurry',
+    control_strength: '0.95',
+  },
+  sketch: {
+    prompt: 'same people, same scene, pencil sketch illustration, hand drawn linework, fine crosshatching, graphite drawing, black and white fine art, same poses same composition',
+    negative_prompt: 'different people, different scene, color, realistic photo, blurry, 3d, painting, noisy',
+    control_strength: '0.97',
+  },
+};
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ✅ Clean files older than 1 hour to save disk space
+function cleanOldFiles() {
+  try {
+    const files = fs.readdirSync(OUTPUT_DIR);
+    const now = Date.now();
+    files.forEach(file => {
+      const filePath = path.join(OUTPUT_DIR, file);
+      const stat = fs.statSync(filePath);
+      if (now - stat.mtimeMs > 60 * 60 * 1000) fs.unlinkSync(filePath);
+    });
+  } catch (e) {
+    console.warn('Cleanup error:', e.message);
+  }
 }
 
-export default function ResultsScreen({ navigation, route }) {
-  const { results, originalImage, retry } = route.params;
-  const success = results.filter(r => r.status === 'done');
-  const [downloading, setDownloading] = useState(null);
-  const headerFade = useRef(new Animated.Value(0)).current;
-  const styleMap = Object.fromEntries(ART_STYLES.map(s => [s.id, s]));
+async function generateClipart(imageBuffer, style, customPrompt = '', retries = 2) {
+  const config = STYLE_PROMPTS[style];
+  if (!config) throw new Error(`Unknown style: ${style}`);
 
-  useEffect(() => {
-    Animated.timing(headerFade, {
-      toValue: 1, duration: 600, useNativeDriver: true
-    }).start();
-  }, []);
+  const finalPrompt = customPrompt
+    ? `${customPrompt}, ${config.prompt}`
+    : config.prompt;
 
-  const download = async (result) => {
-    try {
-      setDownloading(result.style);
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission Required', 'Storage permission needed to save images.');
-        return;
-      }
-      const localFile = await imageToLocalFile(result.outputUrl, result.style);
-      await MediaLibrary.saveToLibraryAsync(localFile);
-      Alert.alert('Saved ✓', `${styleMap[result.style]?.name} clipart saved to gallery!`);
-    } catch (e) {
-      console.error('Download error:', e);
-      Alert.alert('Error', 'Failed to save: ' + e.message);
-    } finally {
-      setDownloading(null);
+  console.log(`[generate] style=${style} strength=${config.control_strength}`);
+
+  const processed = await sharp(imageBuffer)
+    .resize(1024, 1024, { fit: 'cover' })
+    .png()
+    .toBuffer();
+
+  const form = new FormData();
+  form.append('image', processed, { filename: 'input.png', contentType: 'image/png' });
+  form.append('prompt', finalPrompt);
+  form.append('negative_prompt', config.negative_prompt);
+  form.append('control_strength', config.control_strength);
+  form.append('output_format', 'png');
+
+  try {
+    const response = await axios.post(STRUCTURE_URL, form, {
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${STABILITY_KEY}`,
+        Accept: 'image/*',
+      },
+      responseType: 'arraybuffer',
+      timeout: 120000,
+    });
+
+    if (response.headers['finish-reason'] === 'CONTENT_FILTERED') {
+      throw new Error('Image filtered by content policy. Try a different photo.');
     }
-  };
 
-  const share = async (result) => {
-    try {
-      const localFile = await imageToLocalFile(result.outputUrl, result.style);
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(localFile, {
-          mimeType: 'image/png',
-          dialogTitle: 'Share your Clipart',
-        });
-      } else {
-        Alert.alert('Share not available', 'Sharing is not supported on this device.');
-      }
-    } catch (e) {
-      console.error('Share error:', e);
-      Alert.alert('Error', 'Failed to share: ' + e.message);
+    // ✅ Save image to disk and return a real HTTPS URL
+    cleanOldFiles();
+    const filename = `${style}_${Date.now()}.png`;
+    const filepath = path.join(OUTPUT_DIR, filename);
+    fs.writeFileSync(filepath, Buffer.from(response.data));
+    return `${BASE_URL}/outputs/${filename}`;
+
+  } catch (err) {
+    const status = err.response?.status;
+    let body = err.message;
+
+    if (err.response?.data) {
+      try {
+        const raw = Buffer.from(err.response.data).toString('utf8');
+        const parsed = JSON.parse(raw);
+        body = parsed?.errors?.[0] || parsed?.message || raw;
+      } catch (_) {}
     }
-  };
 
-  const downloadAll = async () => {
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission Required', 'Storage permission needed.');
-      return;
+    if (status === 429 && retries > 0) {
+      console.warn(`[generate] 429 rate limit, retrying in 10s... (${retries} left)`);
+      await sleep(10000);
+      return generateClipart(imageBuffer, style, customPrompt, retries - 1);
     }
-    for (const r of success) { await download(r); }
-  };
+    if (status === 402) throw new Error('Stability AI credits exhausted. Add credits at platform.stability.ai');
+    if (status === 422) throw new Error(`Invalid request: ${body}`);
 
-  return (
-    <LinearGradient colors={['#07070e', '#0c0c18']} style={{ flex: 1 }}>
-      <SafeAreaView style={{ flex: 1 }}>
-        <ScrollView showsVerticalScrollIndicator={false}>
-
-          <Animated.View style={{
-            opacity: headerFade,
-            paddingHorizontal: 24, paddingTop: 16, marginBottom: 20
-          }}>
-            <TouchableOpacity
-              onPress={() => navigation.popToTop()}
-              style={{
-                flexDirection: 'row', alignItems: 'center',
-                gap: 6, marginBottom: 18
-              }}
-            >
-              <ArrowLeft size={16} color="#7c5cfc" strokeWidth={2.5} />
-              <Text style={{ color: '#7c5cfc', fontSize: 14, fontWeight: '600' }}>
-                Start Over
-              </Text>
-            </TouchableOpacity>
-
-            <View style={{
-              flexDirection: 'row', alignItems: 'center', gap: 7,
-              alignSelf: 'flex-start',
-              backgroundColor: 'rgba(124,92,252,0.1)', borderWidth: 1,
-              borderColor: 'rgba(124,92,252,0.28)', borderRadius: 20,
-              paddingHorizontal: 14, paddingVertical: 6, marginBottom: 12
-            }}>
-              <View style={{
-                width: 7, height: 7, borderRadius: 3.5,
-                backgroundColor: '#22c55e'
-              }} />
-              <Text style={{ color: '#a78bfa', fontSize: 12, fontWeight: '700' }}>
-                {success.length} STYLE{success.length !== 1 ? 'S' : ''} GENERATED
-              </Text>
-            </View>
-
-            <Text style={{
-              fontSize: 30, fontWeight: '800',
-              color: '#f0eeff', letterSpacing: -1
-            }}>
-              Your Cliparts
-            </Text>
-            <Text style={{ color: '#8880b0', fontSize: 14, marginTop: 4 }}>
-              Tap any image to compare with original
-            </Text>
-          </Animated.View>
-
-          {/* Download All */}
-          {success.length > 1 && (
-            <View style={{ paddingHorizontal: 20, marginBottom: 20 }}>
-              <TouchableOpacity
-                onPress={downloadAll}
-                activeOpacity={0.88}
-                style={{ borderRadius: 16, overflow: 'hidden' }}
-              >
-                <LinearGradient
-                  colors={['#7c5cfc', '#4f46e5']}
-                  style={{
-                    paddingVertical: 16, flexDirection: 'row',
-                    alignItems: 'center', justifyContent: 'center', gap: 9
-                  }}
-                >
-                  <Download size={18} color="#fff" strokeWidth={2.5} />
-                  <Text style={{ color: '#fff', fontWeight: '800', fontSize: 16 }}>
-                    Save All ({success.length}) to Gallery
-                  </Text>
-                </LinearGradient>
-              </TouchableOpacity>
-            </View>
-          )}
-
-          {results.map(result => (
-            <ResultCard
-              key={result.style}
-              result={result}
-              styleInfo={styleMap[result.style]}
-              downloading={downloading === result.style}
-              originalUri={originalImage?.uri}
-              onDownload={() => download(result)}
-              onShare={() => share(result)}
-              onRetry={retry}
-            />
-          ))}
-
-          <View style={{ height: 40 }} />
-        </ScrollView>
-      </SafeAreaView>
-    </LinearGradient>
-  );
+    console.error(`[generate] error ${status}:`, body);
+    throw new Error(`Generation failed (${status}): ${body}`);
+  }
 }
+
+app.get('/health', (req, res) => res.json({
+  status: 'ok', version: '10.0.0',
+  provider: 'Stability AI v2beta control/structure',
+  keySet: !!STABILITY_KEY,
+  baseUrl: BASE_URL,
+  styles: Object.keys(STYLE_PROMPTS),
+}));
+
+app.post('/api/generate', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+    if (!STABILITY_KEY) return res.status(500).json({ error: 'STABILITY_API_KEY not set in .env' });
+
+    const { style = 'cartoon', customPrompt = '' } = req.body;
+    if (!STYLE_PROMPTS[style]) {
+      return res.status(400).json({ error: `Invalid style. Choose from: ${Object.keys(STYLE_PROMPTS).join(', ')}` });
+    }
+
+    const outputUrl = await generateClipart(req.file.buffer, style, customPrompt);
+    res.json({ success: true, style, outputUrl });
+
+  } catch (err) {
+    console.error('[generate] error:', err.message);
+    const status = err.message.includes('credits') ? 402
+      : err.message.includes('content policy') ? 400 : 500;
+    res.status(status).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/generate-all', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+    if (!STABILITY_KEY) return res.status(500).json({ error: 'STABILITY_API_KEY not set in .env' });
+
+    const { customPrompt = '' } = req.body;
+    const styles = Object.keys(STYLE_PROMPTS);
+    const outputs = [];
+
+    for (const style of styles) {
+      try {
+        const outputUrl = await generateClipart(req.file.buffer, style, customPrompt);
+        outputs.push({ style, outputUrl, success: true });
+        console.log(`[generate-all] ✅ ${style} done`);
+      } catch (err) {
+        console.error(`[generate-all] ❌ ${style} failed:`, err.message);
+        outputs.push({ style, error: err.message, success: false });
+        if (err.message.includes('credits')) break;
+      }
+      await sleep(1000);
+    }
+
+    res.json({ success: true, outputs });
+
+  } catch (err) {
+    console.error('[generate-all] error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.use((err, req, res, next) => {
+  if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File too large. Max 10MB.' });
+  res.status(500).json({ error: err.message || 'Server error' });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ ClipArt API running on port ${PORT}`);
+  console.log(`   Base URL : ${BASE_URL}`);
+  console.log(`   Provider : Stability AI v2beta`);
+  console.log(`   Key      : ${STABILITY_KEY ? '✅ set' : '❌ MISSING'}`);
+});
